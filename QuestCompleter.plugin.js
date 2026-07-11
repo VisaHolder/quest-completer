@@ -2,9 +2,10 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Set-and-forget Discord Quest completer. Finishes every quest and claims the reward for you - one at a time, at a human pace, pausing while you're away - and auto-does new quests on their own. No installs, no sites, no tokens.
- * @version 1.5.1
+ * @version 1.5.2
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
+ * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
  */
 
 /*
@@ -25,6 +26,8 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
+const VERSION = "1.5.2"; // keep in sync with @version above - used for the self-updater
+const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 module.exports = class QuestCompleter {
     constructor() {
@@ -40,7 +43,7 @@ module.exports = class QuestCompleter {
         this.session = 0;                 // quests completed since this load
         this.settings = Object.assign(
             {
-                enabled: true, autoEnroll: true, autoClaim: true, notify: true, hideCompleted: true,
+                enabled: true, autoEnroll: true, autoClaim: true, notify: true, hideCompleted: true, checkUpdates: true,
                 activeOnly: true, batchRest: true,
                 activeHours: false, hourStart: 10, hourEnd: 2,       // only run within this window
                 dailyCap: 0,                                          // max quests/day (0 = no limit)
@@ -73,10 +76,16 @@ module.exports = class QuestCompleter {
         this.timer = setInterval(() => this.schedulePump(0), 5 * 60_000);
         // Human warm-up: don't start grinding the instant Discord opens - wait a believable few minutes.
         this.schedulePump(60_000 + Math.random() * 180_000);
+        // Self-update: check GitHub shortly after load, then every 6 hours.
+        if (this.settings.checkUpdates !== false) {
+            setTimeout(() => this.checkUpdate(), 12_000);
+            this.updTimer = setInterval(() => this.checkUpdate(), 6 * 3600_000);
+        }
     }
 
     stop() {
         if (this.timer) { clearInterval(this.timer); this.timer = null; }
+        if (this.updTimer) { clearInterval(this.updTimer); this.updTimer = null; }
         if (this.pumpT) { clearTimeout(this.pumpT); this.pumpT = null; }
         if (this.panelIv) { clearInterval(this.panelIv); this.panelIv = null; }
         for (const t of this.timeouts.values()) clearTimeout(t);
@@ -472,6 +481,51 @@ module.exports = class QuestCompleter {
         }
     }
 
+    // -- self-update: compare GitHub's @version to ours, offer to replace this file ----
+    isNewer(a, b) {
+        const pa = String(a).split(".").map(n => parseInt(n, 10) || 0);
+        const pb = String(b).split(".").map(n => parseInt(n, 10) || 0);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+            const x = pa[i] || 0, y = pb[i] || 0;
+            if (x > y) return true;
+            if (x < y) return false;
+        }
+        return false;
+    }
+
+    async fetchText(url) {
+        if (BdApi.Net?.fetch) { const r = await BdApi.Net.fetch(url, { cache: "no-cache" }); return r.text(); }
+        return new Promise((res, rej) => {
+            try { require("request").get({ url, headers: { "User-Agent": "QuestCompleter" } }, (e, _, b) => e ? rej(e) : res(b)); }
+            catch (err) { rej(err); }
+        });
+    }
+
+    async checkUpdate(manual) {
+        let text = "";
+        try { text = await this.fetchText(UPDATE_URL + "?t=" + Date.now()); }
+        catch (e) { if (manual) UI.showToast?.("Update check failed - try again later.", { type: "error" }); return; }
+        const remote = (text.match(/@version\s+([0-9.]+)/) || [])[1];
+        if (!remote) { if (manual) UI.showToast?.("Couldn't read the latest version.", { type: "error" }); return; }
+        if (!this.isNewer(remote, VERSION)) { if (manual) UI.showToast?.(`You're up to date (v${VERSION}).`, { type: "success" }); return; }
+        BdApi.UI.showConfirmationModal(
+            "QuestCompleter update",
+            `Version ${remote} is out (you have ${VERSION}). Update now? It replaces the plugin and reloads.`,
+            { confirmText: "Update", cancelText: "Later", onConfirm: () => this.applyUpdate(text, remote) }
+        );
+    }
+
+    applyUpdate(text, remote) {
+        try {
+            const fs = require("fs"), path = require("path");
+            fs.writeFileSync(path.join(BdApi.Plugins.folder, "QuestCompleter.plugin.js"), text);
+            UI.showToast?.(`Updated to v${remote} - reloading.`, { type: "success" }); // BD's watcher reloads it
+        } catch (e) {
+            console.error("[QC] update write failed", e);
+            UI.showToast?.("Update failed - grab the latest from GitHub manually.", { type: "error" });
+        }
+    }
+
     // -- settings (plain DOM - no React mount, so it can't silently blank out) -----
     refreshPanel() {
         if (!this._render) return;
@@ -564,6 +618,16 @@ module.exports = class QuestCompleter {
 
         section("Notifications");
         toggle("notify", "Toast on each completion", "A small popup when a quest is done.");
+
+        section("Updates");
+        toggle("checkUpdates", "Check for updates automatically", "Checks GitHub now and then; if a newer version is out it offers to update and replaces itself.");
+        (() => {
+            const b = document.createElement("button");
+            b.textContent = "Check now";
+            b.style.cssText = "margin:10px 0 2px;cursor:pointer;font-size:12.5px;font-weight:600;padding:6px 12px;border:1px solid rgba(255,255,255,.15);border-radius:8px;background:transparent;color:var(--text-normal,#dbdee1);";
+            b.addEventListener("click", () => { UI.showToast?.("Checking for updates", { type: "info" }); this.checkUpdate(true); });
+            wrap.appendChild(b);
+        })();
 
         const hist = document.createElement("div");
         hist.style.cssText = "margin-top:16px;font-size:12px;color:var(--text-muted,#b5bac1);line-height:1.7;";
