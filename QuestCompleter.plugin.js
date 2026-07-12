@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Set-and-forget Discord Quest completer. Finishes every quest and claims the reward for you - one at a time, at a human pace, pausing while you're away - and auto-does new quests on their own. No installs, no sites, no tokens.
- * @version 1.5.3
+ * @version 1.5.4
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.5.3"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.5.4"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 module.exports = class QuestCompleter {
@@ -519,7 +519,9 @@ module.exports = class QuestCompleter {
         try {
             const fs = require("fs"), path = require("path");
             fs.writeFileSync(path.join(BdApi.Plugins.folder, "QuestCompleter.plugin.js"), text);
-            UI.showToast?.(`Updated to v${remote} - reloading.`, { type: "success" }); // BD's watcher reloads it
+            UI.showToast?.(`Updated to v${remote} - reloading.`, { type: "success" });
+            // BD's file watcher usually reloads it; force a reload too in case it doesn't fire.
+            setTimeout(() => { try { BdApi.Plugins.reload("QuestCompleter"); } catch { /* */ } }, 800);
         } catch (e) {
             console.error("[QC] update write failed", e);
             UI.showToast?.("Update failed - grab the latest from GitHub manually.", { type: "error" });
