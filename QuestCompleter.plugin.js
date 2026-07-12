@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Set-and-forget Discord Quest completer. Finishes every quest and claims the reward for you - one at a time, at a human pace, pausing while you're away - and auto-does new quests on their own. No installs, no sites, no tokens.
- * @version 1.5.2
+ * @version 1.5.3
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -21,12 +21,12 @@
  * A watcher re-scans on Discord's quest-fetch / enroll events plus a light timer, so brand-new
  * quests get done on their own (on login or whenever).
  *
- * Heads up: automating quests is against Discord's Terms of Service and Discord does flag it. The
- * risk is to your whole account, not just the reward. You accept that risk by enabling this.
+ * Heads up: automating quests breaks Discord's Terms of Service and Discord flags it. Getting caught
+ * bans you from Quests - you lose quest access and rewards. You accept that risk by enabling this.
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.5.2"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.5.3"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 module.exports = class QuestCompleter {
@@ -539,7 +539,7 @@ module.exports = class QuestCompleter {
 
         const warn = document.createElement("div");
         warn.style.cssText = "margin:0 0 14px;padding:10px 12px;border-radius:8px;background:rgba(240,178,50,.10);border:1px solid rgba(240,178,50,.35);color:#f0c674;font-size:12.5px;line-height:1.5;";
-        warn.innerHTML = "<b>Heads up</b> - automating quests is against Discord's Terms of Service and Discord flags it. The risk is to your whole account. Use at your own risk.";
+        warn.innerHTML = "<b>Heads up</b> - automating quests breaks Discord's Terms of Service and Discord flags it. Getting caught bans you from Quests - you lose quest access and rewards. Use at your own risk.";
         wrap.appendChild(warn);
 
         const head = document.createElement("div");

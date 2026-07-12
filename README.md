@@ -7,8 +7,8 @@ tokens, no accounts. Everything runs through Discord's own quest API and never l
 
 Updates and help: [Telegram - @GamingSandals](https://t.me/GamingSandals)
 
-> Heads up: automating quests is against Discord's Terms of Service and Discord does flag it. The
-> risk is to your whole account, not just the reward. Use it at your own risk.
+> Heads up: automating quests breaks Discord's Terms of Service and Discord flags it. Getting caught
+> bans you from Quests - you lose quest access and rewards. Use it at your own risk.
 
 ## Install
 
