@@ -1,8 +1,8 @@
 /**
  * @name QuestCompleter
  * @author GamingSandals
- * @description Set-and-forget Discord Quest completer. Finishes every quest and claims the reward for you - one at a time, at a human pace, pausing while you're away - and auto-does new quests on their own. No installs, no sites, no tokens.
- * @version 1.5.5
+ * @description Set-and-forget Discord Quest completer. Finishes every quest for you - one at a time, at a human pace, pausing while you're away - and auto-does new quests on their own. Claiming the reward stays a manual click (Discord guards that with a captcha). No installs, no sites, no tokens.
+ * @version 1.5.6
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.5.5"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.5.6"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 module.exports = class QuestCompleter {
@@ -43,7 +43,7 @@ module.exports = class QuestCompleter {
         this.session = 0;                 // quests completed since this load
         this.settings = Object.assign(
             {
-                enabled: true, autoEnroll: true, autoClaim: true, notify: true, hideCompleted: true, checkUpdates: true,
+                enabled: true, autoEnroll: true, autoClaim: false, notify: true, hideCompleted: true, checkUpdates: true,
                 activeOnly: true, batchRest: true,
                 activeHours: false, hourStart: 10, hourEnd: 2,       // only run within this window
                 dailyCap: 0,                                          // max quests/day (0 = no limit)
@@ -386,8 +386,8 @@ module.exports = class QuestCompleter {
             this.stats.orbs = (this.stats.orbs || 0) + orbs;
             this.stats.history = [{ name, orbs, at: Date.now() }, ...(this.stats.history || [])].slice(0, 20);
             Data.save("stats", this.stats);
-            this.claim(id, name); // grab the reward (best-effort; no-op if autoClaim is off or already claimed)
-            if (this.settings.notify) UI.showToast?.(`Quest complete: ${name}${orbs ? ` (+${orbs} orbs)` : ""}`, { type: "success" });
+            this.claim(id, name); // only fires if autoClaim is opted in; the claim itself is captcha-gated by Discord
+            if (this.settings.notify) UI.showToast?.(`Quest done: ${name}${orbs ? ` (+${orbs} orbs)` : ""} - open Quests and press Claim to collect it.`, { type: "success" });
         }
         this.refreshPanel();
         const w = this.waiters.get(id); if (w) { this.waiters.delete(id); w(); }
@@ -595,7 +595,7 @@ module.exports = class QuestCompleter {
         section("Automation");
         toggle("enabled", "Auto-complete quests", "Master switch. On means every current and future quest gets finished for you, one at a time.", v => { if (v) this.schedulePump(0); });
         toggle("autoEnroll", "Auto-accept new quests", "Enrolls you so you don't have to click Accept first.");
-        toggle("autoClaim", "Claim rewards automatically", "Tries to grab the reward when a quest is done. Heads up: Discord now guards claiming with a captcha (their own Claim button hits it too), so most rewards you'll have to claim by hand - this flags each one when it's ready.");
+        toggle("autoClaim", "Try to auto-claim rewards (off by default)", "Leave this OFF. Claiming is captcha-gated by Discord and a bot claim can't pass it - worse, the failed attempt raises your account's risk score and makes Discord captcha you MORE. Progress is automated either way; just click Claim yourself (a normal human click usually gets no captcha).");
         toggle("hideCompleted", "Hide completed quests", "Clears finished quests off Discord's Quests page so the list only shows what's left. Turn off to see everything you've done.", () => { this._hideCache = null; try { this.QuestsStore.emitChange?.(); } catch { /* */ } });
 
         section("Quest types");
