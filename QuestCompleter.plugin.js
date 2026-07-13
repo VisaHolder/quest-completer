@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.5.9
+ * @version 1.6.0
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,8 +26,12 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.5.9"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.6.0"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
+
+// Small shared helpers.
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const esc = (s) => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
 module.exports = class QuestCompleter {
     constructor() {
@@ -40,6 +44,8 @@ module.exports = class QuestCompleter {
         this.timer = null;
         this.pumpT = null;
         this.busy = false;                // only one quest is ever worked at a time
+        this.stopped = false;             // set on stop() so nothing re-schedules after teardown
+        this.cooldowns = new Map();       // questId -> time until which to skip it after a failed attempt
         this.session = 0;                 // quests completed since this load
         this.settings = Object.assign(
             {
@@ -75,21 +81,26 @@ module.exports = class QuestCompleter {
         this.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", () => this.onHeartbeat());
         this.timer = setInterval(() => this.schedulePump(0), 5 * 60_000);
         // Human warm-up: don't start grinding the instant Discord opens - wait a believable few minutes.
-        this.schedulePump(60_000 + Math.random() * 180_000);
-        // Remind you of any rewards sitting unclaimed, once quests have loaded.
-        setTimeout(() => this.remindUnclaimed(), 20_000);
+        // readyAt is a floor enforced in pump(), so an early quest-fetch event can't jump the gun.
+        this.readyAt = Date.now() + 60_000 + Math.random() * 180_000;
+        this.schedulePump(this.readyAt - Date.now());
+        // One-shot startup timers, tracked so stop() can cancel them if we're disabled/reloaded quickly.
+        this.bootTimers = [setTimeout(() => this.remindUnclaimed(), 20_000)]; // remind of unclaimed rewards
         // Self-update: check GitHub shortly after load, then every 6 hours.
         if (this.settings.checkUpdates !== false) {
-            setTimeout(() => this.checkUpdate(), 12_000);
+            this.bootTimers.push(setTimeout(() => this.checkUpdate(), 12_000));
             this.updTimer = setInterval(() => this.checkUpdate(), 6 * 3600_000);
         }
     }
 
     stop() {
+        this.stopped = true; // block any in-flight pump from re-scheduling onto a torn-down instance
         if (this.timer) { clearInterval(this.timer); this.timer = null; }
         if (this.updTimer) { clearInterval(this.updTimer); this.updTimer = null; }
         if (this.pumpT) { clearTimeout(this.pumpT); this.pumpT = null; }
         if (this.panelIv) { clearInterval(this.panelIv); this.panelIv = null; }
+        if (this.bootTimers) { for (const t of this.bootTimers) clearTimeout(t); this.bootTimers = null; }
+        this.cooldowns.clear();
         for (const t of this.timeouts.values()) clearTimeout(t);
         this.timeouts.clear();
         for (const [ev, fn] of this.subs) { try { this.Flux.unsubscribe(ev, fn); } catch { /* */ } }
@@ -114,6 +125,9 @@ module.exports = class QuestCompleter {
         this.StreamingStore = Webpack.getModule(m => m?.getStreamerActiveStreamMetadata);
         this.ChannelStore = Webpack.getStore("ChannelStore");
         this.IdleStore = Webpack.getStore("IdleStore"); // isAFK / isIdle / getSystemLocked / getSystemSuspended
+        // getVoiceChannelId() -> current voice channel or null; stream quests only credit while in a call.
+        this.VoiceStore = Webpack.getStore("SelectedVoiceChannelStore")
+            || Webpack.getModule(m => m && typeof m.getVoiceChannelId === "function");
         // Discord's own native hCaptcha modal + response-props extractor - lets us claim THROUGH a
         // captcha (open Discord's popup, user solves once, resubmit). Best-effort; may be null.
         this.CaptchaModal = Webpack.getModule(m => m && (typeof m.showCaptchaAsync === "function" || typeof m.showCaptcha === "function"));
@@ -189,12 +203,13 @@ module.exports = class QuestCompleter {
     }
 
     // -- quest selection ----------------------------------------------------------
-    allQuests() {
-        // Read the unfiltered map straight from getQuest's backing store so our own logic still sees
-        // completed quests even while the UI-facing getter is hiding them.
-        const q = this.QuestsStore.quests;
-        return q?.values ? [...q.values()] : Object.values(q || {});
+    // The full, unfiltered quest list - bypasses our own hide-completed filter on the `quests` getter
+    // so plugin logic always sees finished quests too (the Quests tab still shows the filtered view).
+    rawQuests() {
+        const raw = this._hideOrig ? this._hideOrig.get.call(this.QuestsStore) : this.QuestsStore.quests;
+        return raw?.values ? [...raw.values()] : Object.values(raw || {});
     }
+    allQuests() { return this.rawQuests(); }
 
     eligibleQuests() {
         const out = [];
@@ -217,6 +232,7 @@ module.exports = class QuestCompleter {
     }
 
     taskOf(quest) {
+        if (!quest?.config) return null;
         const tasks = (quest.config.taskConfig ?? quest.config.taskConfigV2)?.tasks || {};
         // Prefer the quickest fully-automatable task, always completing as PC (incl. mobile video),
         // and only pick task types the user has left enabled.
@@ -231,7 +247,10 @@ module.exports = class QuestCompleter {
     humanGap() { const lo = this.settings.gapMin * 1000, hi = this.settings.gapMax * 1000; return lo + Math.random() * Math.max(0, hi - lo); }
 
     // -- the driver: one quest at a time, evenly spaced ---------------------------
-    schedulePump(delay = 0) { clearTimeout(this.pumpT); this.pumpT = setTimeout(() => this.pump(), delay); }
+    schedulePump(delay = 0) { if (this.stopped) return; clearTimeout(this.pumpT); this.pumpT = setTimeout(() => this.pump(), delay); }
+
+    // A quest we just failed to finish is skipped for a while, so the worker moves on to the others.
+    onCooldown(id) { const t = this.cooldowns.get(id); if (!t) return false; if (Date.now() >= t) { this.cooldowns.delete(id); return false; } return true; }
 
     // Is the user actually at the machine? Uses Discord's own idle/AFK + OS lock/suspend signals.
     isActive() {
@@ -284,8 +303,10 @@ module.exports = class QuestCompleter {
     }
 
     async pump() {
-        if (this.busy || !this.settings.enabled) return;
+        if (this.stopped || this.busy || !this.settings.enabled) return;
         const now = Date.now();
+        // Human warm-up floor - don't touch a quest until the believable delay set in start() has passed.
+        if (this.readyAt && now < this.readyAt) { this.schedulePump(this.readyAt - now); return; }
         // Day-scale rest between sittings (persisted in stats.nextAllowedAt so it survives restarts).
         if (this.settings.batchRest && this.stats.nextAllowedAt && now < this.stats.nextAllowedAt && !this.hasUrgent(this.stats.nextAllowedAt)) {
             this.schedulePump(Math.min(this.stats.nextAllowedAt - now, 20 * 60_000));
@@ -301,26 +322,37 @@ module.exports = class QuestCompleter {
         // Daily cap - stop once you've hit it, pick up again tomorrow.
         this.dayRoll();
         if (this.capReached()) { this.schedulePump(20 * 60_000); return; }
-        const next = this.eligibleQuests().find(q => !this.processing.has(q.id));
-        if (!next) return; // nothing to do; an event or the timer re-triggers later
+        // Pick the first quest that isn't already running or cooling down after a recent failed attempt.
+        const next = this.eligibleQuests().find(q => !this.processing.has(q.id) && !this.onCooldown(q.id));
+        if (!next) return; // nothing to do right now; an event or the 5-min timer re-triggers later
         this.busy = true;
         let worked = false;
         try { worked = await this.completeQuest(next); }
         catch (e) { console.error("[QC] pump", e); }
         this.busy = false;
-        if (worked) { this.dayRoll(); this.stats.dayCount = (this.stats.dayCount || 0) + 1; Data.save("stats", this.stats); }
-        if (worked && this.settings.batchRest && ++this.sitting >= Math.max(1, this.settings.perSitting)) {
-            this.sitting = 0;
-            this.stats.nextAllowedAt = Date.now() + this.restDelay(); // rest for hours before the next few
+        if (worked) {
+            this.cooldowns.delete(next.id);
+            this.dayRoll();
+            this.stats.dayCount = (this.stats.dayCount || 0) + 1;
             Data.save("stats", this.stats);
-            this.refreshPanel();
-            this.schedulePump(Math.min(this.stats.nextAllowedAt - Date.now(), 20 * 60_000));
-            return;
+            if (this.settings.batchRest && ++this.sitting >= Math.max(1, this.settings.perSitting)) {
+                this.sitting = 0;
+                this.stats.nextAllowedAt = Date.now() + this.restDelay(); // rest for a while before the next few
+                Data.save("stats", this.stats);
+                this.refreshPanel();
+                this.schedulePump(Math.min(this.stats.nextAllowedAt - Date.now(), 20 * 60_000));
+                return;
+            }
+        } else {
+            // Couldn't finish it (e.g. a stream quest with no voice call). Skip it for a bit so the worker
+            // moves on to other quests instead of re-selecting the same stuck one every cycle.
+            this.cooldowns.set(next.id, Date.now() + 15 * 60_000 + Math.random() * 5 * 60_000);
         }
-        this.schedulePump(this.humanGap()); // short, human spacing within a sitting
+        this.schedulePump(this.humanGap()); // short, human spacing before the next attempt
     }
 
-    runAll() { this.stats.nextAllowedAt = 0; this.sitting = 0; Data.save("stats", this.stats); this.schedulePump(0); } // "Run now" ignores the rest
+    // "Run now" - drop the warm-up, the batch rest, and any per-quest cooldowns, and scan immediately.
+    runAll() { this.readyAt = 0; this.cooldowns.clear(); this.stats.nextAllowedAt = 0; this.sitting = 0; Data.save("stats", this.stats); this.schedulePump(0); }
 
     async completeQuest(quest) {
         const id = quest.id, name = this.questName(quest);
@@ -334,12 +366,13 @@ module.exports = class QuestCompleter {
                 await this.enroll(id).catch(() => { /* not enrollable this way - user can Accept in UI */ });
             }
             const n = task.name;
-            if (/VIDEO/.test(n)) await this.doVideo(quest, task);
-            else if (/STREAM/.test(n)) await this.doStream(quest, task, name);
-            else if (/ACTIVITY/.test(n)) await this.doActivity(quest, task);
-            else if (/PLAY|DESKTOP|CONSOLE|XBOX|PLAYSTATION/.test(n)) await this.doPlay(quest, task, name);
+            let ok;
+            if (/VIDEO/.test(n)) ok = await this.doVideo(quest, task);
+            else if (/STREAM/.test(n)) ok = await this.doStream(quest, task, name);
+            else if (/ACTIVITY/.test(n)) ok = await this.doActivity(quest, task);
+            else if (/PLAY|DESKTOP|CONSOLE|XBOX|PLAYSTATION/.test(n)) ok = await this.doPlay(quest, task, name);
             else { console.warn("[QC] unsupported task", n, "for", name); this.processing.delete(id); return false; }
-            return true;
+            return ok !== false;
         } catch (e) {
             console.error("[QC] complete failed for", name, e);
             this.processing.delete(id);
@@ -421,7 +454,7 @@ module.exports = class QuestCompleter {
             if (this.settings.notify) UI.showToast?.(`Quest done: ${name}${orbs ? ` (+${orbs} orbs)` : ""} - open Quests and press Claim to collect it.`, { type: "success" });
         }
         this.refreshPanel();
-        const w = this.waiters.get(id); if (w) { this.waiters.delete(id); w(); }
+        const w = this.waiters.get(id); if (w) { this.waiters.delete(id); w(success); }
     }
 
     // Resolves when finish() runs for this quest, or after a safety timeout.
@@ -436,17 +469,21 @@ module.exports = class QuestCompleter {
     async doVideo(quest, task) {
         const id = quest.id, name = this.questName(quest), target = task.target;
         if (this.settings.notify) UI.showToast?.(`Working on: ${name}`, { type: "info" });
+        const base = this.progress(quest, task.name); // resume from wherever the video already is
         const startedAt = Date.now();
-        let ts = this.progress(quest, task.name);
+        let ts = base;
         while (ts < target) {
             await sleep(5000 + Math.random() * 4000); // a real viewer pings every few seconds
-            const elapsed = (Date.now() - startedAt) / 1000 + ts;
-            ts = Math.min(target, Math.max(ts + 1, Math.floor(elapsed) - Math.floor(Math.random() * 2)));
+            // Never climb past real wall-clock time - watching faster than real-time is the #1 bot tell.
+            const realSeconds = (Date.now() - startedAt) / 1000;
+            ts = Math.min(target, Math.max(ts + 1, base + Math.floor(realSeconds) - Math.floor(Math.random() * 2)));
             try { await this.Api.post({ url: `/quests/${id}/video-progress`, body: { timestamp: Number(ts.toFixed(2)) } }); }
             catch (e) { console.error("[QC] video-progress", e); break; }
             if (this.QuestsStore.getQuest(id)?.userStatus?.completedAt) break;
         }
-        this.finish(id, name, true);
+        const done = ts >= target || !!this.QuestsStore.getQuest(id)?.userStatus?.completedAt;
+        this.finish(id, name, done);
+        return done;
     }
 
     // PLAY_* - pretend the game is running; Discord's own client sends the heartbeats.
@@ -475,7 +512,7 @@ module.exports = class QuestCompleter {
         this.fakeGames.set(quest.id, game);
         this.dispatchGames([game], []);
         if (this.settings.notify) UI.showToast?.(`Working on: ${name}`, { type: "info" });
-        await this.awaitDone(quest.id, name, 30 * 60_000); // completion detected in onHeartbeat()
+        return await this.awaitDone(quest.id, name, 30 * 60_000); // completion detected in onHeartbeat()
     }
 
     // PLAY_ACTIVITY - heartbeat on a real cadence using a DM/call channel as the stream key.
@@ -484,24 +521,35 @@ module.exports = class QuestCompleter {
         if (this.settings.notify) UI.showToast?.(`Working on: ${name}`, { type: "info" });
         const ch = this.ChannelStore?.getSortedPrivateChannels?.()?.[0]?.id || "0";
         const streamKey = `call:${ch}:1`;
-        while (true) {
+        const startedAt = Date.now();
+        let done = false;
+        // Cap the run so a quest that never credits can't hold the single worker slot forever.
+        while (Date.now() - startedAt < 30 * 60_000) {
             const cur = this.progress(quest, task.name);
             const terminal = cur >= task.target;
             try { await this.Api.post({ url: `/quests/${id}/heartbeat`, body: { stream_key: streamKey, terminal } }); }
             catch (e) { console.error("[QC] activity heartbeat", e); break; }
-            if (terminal || this.QuestsStore.getQuest(id)?.userStatus?.completedAt) break;
+            if (terminal || this.QuestsStore.getQuest(id)?.userStatus?.completedAt) { done = true; break; }
             await sleep(20000 + Math.random() * 4000);
         }
-        this.finish(id, name, true);
+        this.finish(id, name, done);
+        return done;
     }
 
     // STREAM_ON_DESKTOP - fake the stream metadata. Discord only counts it if you're in a voice call.
     async doStream(quest, task, name) {
+        // Discord only credits a stream while you're in a voice call. If you're not, don't tie up the
+        // single worker for 30 minutes on something that can't complete - bail and let it retry later.
+        if (this.VoiceStore && !this.VoiceStore.getVoiceChannelId?.()) {
+            if (this.settings.notify) UI.showToast?.(`${name}: join a voice call and it'll finish the stream quest.`, { type: "info" });
+            this.finish(quest.id, name, false);
+            return false;
+        }
         const appId = quest.config.application?.id;
         const pid = 10000 + Math.floor(Math.random() * 40000);
         this.fakeStreams.set(quest.id, { id: appId, pid, sourceName: null });
-        if (this.settings.notify) UI.showToast?.(`Working on: ${name} - join any voice call so Discord counts it.`, { type: "info" });
-        await this.awaitDone(quest.id, name, 30 * 60_000);
+        if (this.settings.notify) UI.showToast?.(`Working on: ${name} - stay in the call so Discord counts it.`, { type: "info" });
+        return await this.awaitDone(quest.id, name, 30 * 60_000);
     }
 
     // Fired on every heartbeat Discord sends for a faked game/stream - finish anything that's done.
@@ -518,8 +566,7 @@ module.exports = class QuestCompleter {
     // -- reminder: on load, list any rewards sitting unclaimed so you don't forget to grab them ----
     unclaimedNames() {
         try {
-            const raw = this._hideOrig ? this._hideOrig.get.call(this.QuestsStore) : this.QuestsStore.quests;
-            const list = raw?.values ? [...raw.values()] : Object.values(raw || {});
+            const list = this.rawQuests();
             const now = Date.now();
             return list.filter(q => {
                 const us = q?.userStatus;
@@ -732,6 +779,3 @@ module.exports = class QuestCompleter {
         return wrap;
     }
 };
-
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const esc = (s) => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
