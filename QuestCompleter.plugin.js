@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Set-and-forget Discord Quest completer. Finishes every quest for you - one at a time, at a human pace, pausing while you're away - and auto-does new quests on their own. Claiming the reward stays a manual click (Discord guards that with a captcha). No installs, no sites, no tokens.
- * @version 1.5.6
+ * @version 1.5.7
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.5.6"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.5.7"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 module.exports = class QuestCompleter {
@@ -112,6 +112,10 @@ module.exports = class QuestCompleter {
         this.StreamingStore = Webpack.getModule(m => m?.getStreamerActiveStreamMetadata);
         this.ChannelStore = Webpack.getStore("ChannelStore");
         this.IdleStore = Webpack.getStore("IdleStore"); // isAFK / isIdle / getSystemLocked / getSystemSuspended
+        // Discord's own native hCaptcha modal + response-props extractor - lets us claim THROUGH a
+        // captcha (open Discord's popup, user solves once, resubmit). Best-effort; may be null.
+        this.CaptchaModal = Webpack.getModule(m => m && (typeof m.showCaptchaAsync === "function" || typeof m.showCaptcha === "function"));
+        this.extractCaptcha = Webpack.getModule(m => m && typeof m.extractCaptchaPropsFromResponse === "function")?.extractCaptchaPropsFromResponse || null;
         // The Flux dispatcher is a nested export in current builds - needs searchExports to surface.
         this.Flux = Webpack.getModule(m => m?.dispatch && m?.subscribe && m?.unsubscribe)
             || Webpack.getModule(m => m?.dispatch && m?.subscribe, { searchExports: true });
@@ -346,9 +350,10 @@ module.exports = class QuestCompleter {
         return this.Api.post({ url: `/quests/${id}/enroll`, body: { location: 0 } });
     }
 
-    // Claim the reward once the quest is complete. Discord sometimes gates claiming behind a captcha,
-    // which no script can bypass (it's an hCaptcha) - so we claim when we can, and when a captcha is
-    // required we tell you to press Claim yourself instead of failing silently.
+    // Claim the reward once the quest is complete. You can't BYPASS the hCaptcha, but you can let
+    // Discord's OWN native captcha popup handle it: on a captcha response we open the native modal (you
+    // solve it once), then resubmit the claim with the token and it goes through - exactly how Discord's
+    // own Claim button works. If the modal hooks aren't found we fall back to nudging you to click Claim.
     async claim(id, name) {
         if (!this.settings.autoClaim) return;
         for (let i = 0; i < 5; i++) { // wait for Discord to register completion, then claim once
@@ -358,19 +363,43 @@ module.exports = class QuestCompleter {
             await sleep(2500);
         }
         if (this.QuestsStore.getQuest(id)?.userStatus?.claimedAt) return;
+        const url = `/quests/${id}/claim-reward`;
+        const body = { platform: 0, location: 11, is_targeted: false, metadata_raw: null, metadata_sealed: null, traffic_metadata_raw: null, traffic_metadata_sealed: null };
         try {
-            await this.Api.post({ url: `/quests/${id}/claim-reward`, body: { platform: 0, location: 11, is_targeted: false, metadata_raw: null, metadata_sealed: null, traffic_metadata_raw: null, traffic_metadata_sealed: null } });
+            await this.Api.post({ url, body });
+            if (this.settings.notify) UI.showToast?.(`Claimed: ${name}`, { type: "success" });
         } catch (e) {
-            // hCaptcha can't be solved by a script - Discord's own Claim button hits it too. Flag it
-            // with a persistent notice so you always know a reward is sitting ready to claim by hand.
-            if (e?.body?.captcha_key || e?.body?.captcha_sitekey || e?.body?.captcha_service) {
-                const msg = `QuestCompleter: "${name || "a quest"}" reward is ready, but Discord needs a captcha to claim it - open the Quests tab and press Claim.`;
-                try { BdApi.UI.showNotice(msg, { type: "warning" }); }
-                catch { UI.showToast?.(msg, { type: "warn" }); }
-            } else {
+            if (!(e?.body?.captcha_key || e?.body?.captcha_sitekey || e?.body?.captcha_service)) {
                 console.error("[QC] claim failed - you can claim it manually in the Quests tab", e);
+                return;
             }
+            // Captcha required. Try Discord's native modal (you solve it once), then resubmit with the token.
+            try {
+                const solved = await this.solveCaptcha(e.body);
+                const key = solved && (solved.captcha_key || solved.token || (typeof solved === "string" ? solved : null));
+                if (key) {
+                    const headers = { "X-Captcha-Key": key };
+                    const rq = solved.captcha_rqtoken || e.body.captcha_rqtoken;
+                    const sid = solved.captcha_session_id || e.body.captcha_session_id;
+                    if (rq) headers["X-Captcha-Rqtoken"] = rq;
+                    if (sid) headers["X-Captcha-Session-Id"] = sid;
+                    await this.Api.post({ url, body, headers });
+                    if (this.settings.notify) UI.showToast?.(`Claimed: ${name}`, { type: "success" });
+                    return;
+                }
+            } catch { /* modal cancelled or hooks unavailable - fall through to the manual nudge */ }
+            const msg = `QuestCompleter: "${name || "a quest"}" reward is ready - open the Quests tab and press Claim (Discord wants a captcha).`;
+            try { BdApi.UI.showNotice(msg, { type: "warning" }); } catch { UI.showToast?.(msg, { type: "warn" }); }
         }
+    }
+
+    // Open Discord's native hCaptcha modal for a captcha response and resolve with the solved token/props.
+    async solveCaptcha(respBody) {
+        const C = this.CaptchaModal;
+        const fn = C && (C.showCaptchaAsync || C.showCaptcha);
+        if (typeof fn !== "function") return null;
+        const props = this.extractCaptcha ? this.extractCaptcha(respBody) : respBody;
+        return fn.call(C, props);
     }
 
     finish(id, name, success = true) {
@@ -595,7 +624,7 @@ module.exports = class QuestCompleter {
         section("Automation");
         toggle("enabled", "Auto-complete quests", "Master switch. On means every current and future quest gets finished for you, one at a time.", v => { if (v) this.schedulePump(0); });
         toggle("autoEnroll", "Auto-accept new quests", "Enrolls you so you don't have to click Accept first.");
-        toggle("autoClaim", "Try to auto-claim rewards (off by default)", "Leave this OFF. Claiming is captcha-gated by Discord and a bot claim can't pass it - worse, the failed attempt raises your account's risk score and makes Discord captcha you MORE. Progress is automated either way; just click Claim yourself (a normal human click usually gets no captcha).");
+        toggle("autoClaim", "Auto-claim rewards", "Claims the reward when a quest is done. If Discord asks for a captcha, its own native popup appears - solve it once and the claim goes through (nobody can auto-solve it; this just uses Discord's own flow). Claiming is risk-based, so leave off if you'd rather zero automated claim requests and just click Claim yourself.");
         toggle("hideCompleted", "Hide completed quests", "Clears finished quests off Discord's Quests page so the list only shows what's left. Turn off to see everything you've done.", () => { this._hideCache = null; try { this.QuestsStore.emitChange?.(); } catch { /* */ } });
 
         section("Quest types");
