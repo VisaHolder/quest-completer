@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.6.0
+ * @version 1.7.0
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.6.0"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.7.0"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -46,11 +46,13 @@ module.exports = class QuestCompleter {
         this.busy = false;                // only one quest is ever worked at a time
         this.stopped = false;             // set on stop() so nothing re-schedules after teardown
         this.cooldowns = new Map();       // questId -> time until which to skip it after a failed attempt
+        this.seenQuests = new Set();      // quest ids we've already seen, for the new-quest heads-up
+        this.seenInit = false;            // don't announce the whole existing list on first load
         this.session = 0;                 // quests completed since this load
         this.settings = Object.assign(
             {
-                enabled: true, autoEnroll: true, autoClaim: false, notify: true, hideCompleted: true, checkUpdates: true, remindUnclaimed: true,
-                activeOnly: true, batchRest: true,
+                enabled: true, autoEnroll: true, autoClaim: false, notify: true, notifyNew: true, hideCompleted: true, checkUpdates: true, remindUnclaimed: true,
+                activeOnly: true, batchRest: true, stealth: true,
                 activeHours: false, hourStart: 10, hourEnd: 2,       // only run within this window
                 dailyCap: 0,                                          // max quests/day (0 = no limit)
                 doVideo: true, doPlay: true, doActivity: true, doStream: true, // per-type switches
@@ -76,7 +78,7 @@ module.exports = class QuestCompleter {
         this.patchStores();
         this.installHide();
         // Re-scan when Discord (re)fetches quests or enrolls you; watch heartbeats for completion.
-        this.subscribe("QUESTS_FETCH_CURRENT_QUESTS_SUCCESS", () => this.schedulePump(this.humanGap()));
+        this.subscribe("QUESTS_FETCH_CURRENT_QUESTS_SUCCESS", () => { this.checkNewQuests(); this.schedulePump(this.humanGap()); });
         this.subscribe("QUESTS_ENROLL_SUCCESS", () => this.schedulePump(2000));
         this.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", () => this.onHeartbeat());
         this.timer = setInterval(() => this.schedulePump(0), 5 * 60_000);
@@ -242,9 +244,14 @@ module.exports = class QuestCompleter {
         return first ? { name: first, target: tasks[first].target ?? tasks[first].amount ?? 0 } : null;
     }
 
-    questName(quest) { return quest?.config?.messages?.questName || quest?.config?.application?.name || "quest"; }
+    // Quest name for display. Strip angle brackets + cap length so a name from Discord's API can never
+    // carry markup into a toast/notice/DOM sink (defense-in-depth - names are server-authored, but we
+    // still never trust them). The innerHTML sinks also esc() on top of this.
+    questName(quest) { const n = quest?.config?.messages?.questName || quest?.config?.application?.name || "quest"; return String(n).replace(/[<>]/g, "").slice(0, 120); }
     progress(quest, taskName) { return this.QuestsStore.getQuest(quest.id)?.userStatus?.progress?.[taskName]?.value ?? 0; }
     humanGap() { const lo = this.settings.gapMin * 1000, hi = this.settings.gapMax * 1000; return lo + Math.random() * Math.max(0, hi - lo); }
+    // Gap before the next quest; in stealth mode, every so often a longer "wandered off" break.
+    nextGap() { let g = this.humanGap(); if (this.settings.stealth && Math.random() < 0.2) g += 120_000 + Math.random() * 300_000; return g; }
 
     // -- the driver: one quest at a time, evenly spaced ---------------------------
     schedulePump(delay = 0) { if (this.stopped) return; clearTimeout(this.pumpT); this.pumpT = setTimeout(() => this.pump(), delay); }
@@ -322,9 +329,14 @@ module.exports = class QuestCompleter {
         // Daily cap - stop once you've hit it, pick up again tomorrow.
         this.dayRoll();
         if (this.capReached()) { this.schedulePump(20 * 60_000); return; }
-        // Pick the first quest that isn't already running or cooling down after a recent failed attempt.
-        const next = this.eligibleQuests().find(q => !this.processing.has(q.id) && !this.onCooldown(q.id));
-        if (!next) return; // nothing to do right now; an event or the 5-min timer re-triggers later
+        // Candidates: not already running, not cooling down after a recent failed attempt.
+        const pool = this.eligibleQuests().filter(q => !this.processing.has(q.id) && !this.onCooldown(q.id));
+        if (!pool.length) return; // nothing to do right now; an event or the 5-min timer re-triggers later
+        // Anything about to expire is always done first; otherwise stealth mode picks at random so the
+        // order never looks scripted (still finishes them all), and non-stealth just takes the next one.
+        const soon = Date.now() + 2 * 3600_000;
+        const next = pool.find(q => { const e = new Date(q.config.expiresAt).getTime(); return e && e < soon; })
+            || (this.settings.stealth ? pool[Math.floor(Math.random() * pool.length)] : pool[0]);
         this.busy = true;
         let worked = false;
         try { worked = await this.completeQuest(next); }
@@ -348,7 +360,7 @@ module.exports = class QuestCompleter {
             // moves on to other quests instead of re-selecting the same stuck one every cycle.
             this.cooldowns.set(next.id, Date.now() + 15 * 60_000 + Math.random() * 5 * 60_000);
         }
-        this.schedulePump(this.humanGap()); // short, human spacing before the next attempt
+        this.schedulePump(this.nextGap()); // short, human spacing before the next attempt
     }
 
     // "Run now" - drop the warm-up, the batch rest, and any per-quest cooldowns, and scan immediately.
@@ -585,6 +597,24 @@ module.exports = class QuestCompleter {
         try { BdApi.UI.showNotice(msg, { type: "info" }); } catch { UI.showToast?.(msg, { type: "info" }); }
     }
 
+    // Heads-up when Discord hands out a quest we haven't seen before (the first load just seeds the set).
+    checkNewQuests() {
+        const current = this.eligibleQuests();
+        if (!this.seenInit) { this.seenQuests = new Set(current.map(q => q.id)); this.seenInit = true; return; }
+        for (const q of current) {
+            if (this.seenQuests.has(q.id)) continue;
+            this.seenQuests.add(q.id);
+            if (this.settings.notifyNew) UI.showToast?.(`New quest: ${this.questName(q)} - QuestCompleter will handle it.`, { type: "info" });
+        }
+    }
+
+    // Are Discord's internals still where we expect them? (Discord shuffles modules between updates.)
+    modulesHealth() {
+        const coreOk = !!(this.QuestsStore && this.Api && this.Flux);
+        const optional = { "play quests": this.RunningGameStore, "stream quests": this.StreamingStore, "voice detection": this.VoiceStore, "active-pause": this.IdleStore };
+        return { ok: coreOk, missing: Object.keys(optional).filter(k => !optional[k]) };
+    }
+
     // -- self-update: compare GitHub's @version to ours, offer to replace this file ----
     isNewer(a, b) {
         const pa = String(a).split(".").map(n => parseInt(n, 10) || 0);
@@ -647,6 +677,11 @@ module.exports = class QuestCompleter {
         warn.style.cssText = "margin:0 0 14px;padding:10px 12px;border-radius:8px;background:rgba(240,178,50,.10);border:1px solid rgba(240,178,50,.35);color:#f0c674;font-size:12.5px;line-height:1.5;";
         warn.innerHTML = "<b>Heads up</b> - automating quests breaks Discord's Terms of Service and Discord flags it. Getting caught bans you from Quests - you lose quest access and rewards. Use at your own risk.";
         wrap.appendChild(warn);
+
+        // Shows whether Discord's internals still resolve - Discord moves modules between updates.
+        const health = document.createElement("div");
+        health.style.cssText = "margin:0 0 12px;padding:8px 12px;border-radius:8px;font-size:12px;line-height:1.5;";
+        wrap.appendChild(health);
 
         const head = document.createElement("div");
         head.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;margin:2px 0 10px;";
@@ -713,6 +748,7 @@ module.exports = class QuestCompleter {
         section("Pacing");
         toggle("activeOnly", "Only while you're active", "Pauses on its own when you're idle, AFK, or your screen is locked.");
         toggle("batchRest", "Spread quests out", "Do a couple, then wait 1-2 hours before the next few, so a full set finishes over a few hours instead of all at once. Anything about to expire is still done right away.", () => this.schedulePump(0));
+        toggle("stealth", "Extra randomness", "Do quests in a random order and every so often take a longer break, so the timing never looks scripted. Still finishes them all; anything about to expire is still done first.");
         toggle("activeHours", "Only during set hours", "Limit it to a daily time window.", () => this.schedulePump(0));
         (() => {
             const row = document.createElement("div");
@@ -729,6 +765,7 @@ module.exports = class QuestCompleter {
 
         section("Notifications");
         toggle("notify", "Toast on each completion", "A small popup when a quest is done.");
+        toggle("notifyNew", "New-quest heads-up", "A quiet popup when Discord hands out a brand-new quest, so you know it got picked up.");
         toggle("remindUnclaimed", "Remind me of unclaimed rewards", "When Discord opens, pops a note listing any quest rewards sitting unclaimed - so you don't forget to press Claim.");
 
         section("Updates");
@@ -750,6 +787,17 @@ module.exports = class QuestCompleter {
         this._render = () => {
             big.textContent = String(this.stats.completed || 0);
             small.textContent = `quests all-time  -  ${this.stats.orbs || 0} orbs earned  -  ${this.session} this session`;
+            const h = this.modulesHealth();
+            if (!h.ok) {
+                health.style.cssText = "margin:0 0 12px;padding:8px 12px;border-radius:8px;font-size:12px;line-height:1.5;background:rgba(237,66,69,.10);border:1px solid rgba(237,66,69,.35);color:#f5a3a5;";
+                health.innerHTML = "<b>Not connected.</b> A Discord update likely moved something - try Updates &gt; Check now, or report it.";
+            } else if (h.missing.length) {
+                health.style.cssText = "margin:0 0 12px;padding:8px 12px;border-radius:8px;font-size:12px;line-height:1.5;background:rgba(240,178,50,.08);border:1px solid rgba(240,178,50,.25);color:#e0be82;";
+                health.innerHTML = `<b>Connected.</b> Unavailable on this build: ${esc(h.missing.join(", "))} - those quest types may not complete.`;
+            } else {
+                health.style.cssText = "margin:0 0 12px;padding:8px 12px;border-radius:8px;font-size:12px;line-height:1.5;background:rgba(59,165,93,.10);border:1px solid rgba(59,165,93,.30);color:#8fce9b;";
+                health.innerHTML = "<b>Connected</b> - all Discord hooks resolved.";
+            }
             let working = [], pending = "none";
             try {
                 working = [...this.processing].map(id => {
