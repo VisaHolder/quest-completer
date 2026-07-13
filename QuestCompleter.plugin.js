@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Set-and-forget Discord Quest completer. Finishes every quest and claims the reward for you - one at a time, at a human pace, pausing while you're away - and auto-does new quests on their own. No installs, no sites, no tokens.
- * @version 1.5.4
+ * @version 1.5.5
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.5.4"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.5.5"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 module.exports = class QuestCompleter {
@@ -361,9 +361,12 @@ module.exports = class QuestCompleter {
         try {
             await this.Api.post({ url: `/quests/${id}/claim-reward`, body: { platform: 0, location: 11, is_targeted: false, metadata_raw: null, metadata_sealed: null, traffic_metadata_raw: null, traffic_metadata_sealed: null } });
         } catch (e) {
-            // Detect the captcha specifically and nudge the user; anything else is just logged.
+            // hCaptcha can't be solved by a script - Discord's own Claim button hits it too. Flag it
+            // with a persistent notice so you always know a reward is sitting ready to claim by hand.
             if (e?.body?.captcha_key || e?.body?.captcha_sitekey || e?.body?.captcha_service) {
-                UI.showToast?.(`Captcha needed to claim "${name || "reward"}" - open the Quests tab and press Claim.`, { type: "warn" });
+                const msg = `QuestCompleter: "${name || "a quest"}" reward is ready, but Discord needs a captcha to claim it - open the Quests tab and press Claim.`;
+                try { BdApi.UI.showNotice(msg, { type: "warning" }); }
+                catch { UI.showToast?.(msg, { type: "warn" }); }
             } else {
                 console.error("[QC] claim failed - you can claim it manually in the Quests tab", e);
             }
@@ -592,7 +595,7 @@ module.exports = class QuestCompleter {
         section("Automation");
         toggle("enabled", "Auto-complete quests", "Master switch. On means every current and future quest gets finished for you, one at a time.", v => { if (v) this.schedulePump(0); });
         toggle("autoEnroll", "Auto-accept new quests", "Enrolls you so you don't have to click Accept first.");
-        toggle("autoClaim", "Claim rewards automatically", "Grabs the reward as soon as a quest is done. If Discord throws a captcha, this skips quietly and you press Claim yourself.");
+        toggle("autoClaim", "Claim rewards automatically", "Tries to grab the reward when a quest is done. Heads up: Discord now guards claiming with a captcha (their own Claim button hits it too), so most rewards you'll have to claim by hand - this flags each one when it's ready.");
         toggle("hideCompleted", "Hide completed quests", "Clears finished quests off Discord's Quests page so the list only shows what's left. Turn off to see everything you've done.", () => { this._hideCache = null; try { this.QuestsStore.emitChange?.(); } catch { /* */ } });
 
         section("Quest types");
