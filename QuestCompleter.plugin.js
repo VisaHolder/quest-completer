@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Set-and-forget Discord Quest completer. Finishes every quest for you - one at a time, at a human pace, pausing while you're away - and auto-does new quests on their own. Claiming the reward stays a manual click (Discord guards that with a captcha). No installs, no sites, no tokens.
- * @version 1.5.7
+ * @version 1.5.8
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.5.7"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.5.8"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 module.exports = class QuestCompleter {
@@ -43,7 +43,7 @@ module.exports = class QuestCompleter {
         this.session = 0;                 // quests completed since this load
         this.settings = Object.assign(
             {
-                enabled: true, autoEnroll: true, autoClaim: false, notify: true, hideCompleted: true, checkUpdates: true,
+                enabled: true, autoEnroll: true, autoClaim: false, notify: true, hideCompleted: true, checkUpdates: true, remindUnclaimed: true,
                 activeOnly: true, batchRest: true,
                 activeHours: false, hourStart: 10, hourEnd: 2,       // only run within this window
                 dailyCap: 0,                                          // max quests/day (0 = no limit)
@@ -76,6 +76,8 @@ module.exports = class QuestCompleter {
         this.timer = setInterval(() => this.schedulePump(0), 5 * 60_000);
         // Human warm-up: don't start grinding the instant Discord opens - wait a believable few minutes.
         this.schedulePump(60_000 + Math.random() * 180_000);
+        // Remind you of any rewards sitting unclaimed, once quests have loaded.
+        setTimeout(() => this.remindUnclaimed(), 20_000);
         // Self-update: check GitHub shortly after load, then every 6 hours.
         if (this.settings.checkUpdates !== false) {
             setTimeout(() => this.checkUpdate(), 12_000);
@@ -513,6 +515,29 @@ module.exports = class QuestCompleter {
         }
     }
 
+    // -- reminder: on load, list any rewards sitting unclaimed so you don't forget to grab them ----
+    unclaimedNames() {
+        try {
+            const raw = this._hideOrig ? this._hideOrig.get.call(this.QuestsStore) : this.QuestsStore.quests;
+            const list = raw?.values ? [...raw.values()] : Object.values(raw || {});
+            const now = Date.now();
+            return list.filter(q => {
+                const us = q?.userStatus;
+                if (!us || !us.completedAt || us.claimedAt) return false;
+                const exp = q.config?.expiresAt ? new Date(q.config.expiresAt).getTime() : 0;
+                return !(exp && exp < now); // skip expired - can't claim those anyway
+            }).map(q => this.questName(q));
+        } catch { return []; }
+    }
+
+    remindUnclaimed() {
+        if (!this.settings.remindUnclaimed) return;
+        const names = this.unclaimedNames();
+        if (!names.length) return;
+        const msg = `QuestCompleter: ${names.length} reward${names.length > 1 ? "s" : ""} ready to claim - ${names.join(", ")}. Open the Quests tab and press Claim.`;
+        try { BdApi.UI.showNotice(msg, { type: "info" }); } catch { UI.showToast?.(msg, { type: "info" }); }
+    }
+
     // -- self-update: compare GitHub's @version to ours, offer to replace this file ----
     isNewer(a, b) {
         const pa = String(a).split(".").map(n => parseInt(n, 10) || 0);
@@ -652,6 +677,7 @@ module.exports = class QuestCompleter {
 
         section("Notifications");
         toggle("notify", "Toast on each completion", "A small popup when a quest is done.");
+        toggle("remindUnclaimed", "Remind me of unclaimed rewards", "When Discord opens, pops a note listing any quest rewards sitting unclaimed - so you don't forget to press Claim.");
 
         section("Updates");
         toggle("checkUpdates", "Check for updates automatically", "Checks GitHub now and then; if a newer version is out it offers to update and replaces itself.");
