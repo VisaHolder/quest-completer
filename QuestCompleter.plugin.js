@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.7.1
+ * @version 1.7.2
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.7.1"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.7.2"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -654,16 +654,34 @@ module.exports = class QuestCompleter {
     }
 
     applyUpdate(text, remote) {
+        // Save the new file, and only claim success if the bytes actually landed on disk.
         try {
             const fs = require("fs"), path = require("path");
-            fs.writeFileSync(path.join(BdApi.Plugins.folder, "QuestCompleter.plugin.js"), text);
-            UI.showToast?.(`Updated to v${remote} - reloading.`, { type: "success" });
-            // BD's file watcher usually reloads it; force a reload too in case it doesn't fire.
-            setTimeout(() => { try { BdApi.Plugins.reload("QuestCompleter"); } catch { /* */ } }, 800);
+            const meta = BdApi.Plugins.get("QuestCompleter");
+            const folder = BdApi.Plugins.folder;
+            if (!folder) throw new Error("couldn't find the plugins folder");
+            const file = path.join(folder, (meta && meta.filename) || "QuestCompleter.plugin.js");
+            fs.writeFileSync(file, text);
+            const back = fs.readFileSync(file, "utf8"); // read it back to confirm the write took
+            if (!new RegExp("@version\\s+" + remote.replace(/\./g, "\\.")).test(back)) throw new Error("the file didn't change on disk");
         } catch (e) {
             console.error("[QC] update write failed", e);
-            UI.showToast?.("Update failed - grab the latest from GitHub manually.", { type: "error" });
+            BdApi.UI.showConfirmationModal("QuestCompleter update",
+                `Couldn't save the update automatically (${(e && e.message) || e}). Get QuestCompleter.plugin.js from github.com/VisaHolder/quest-completer and drop it in your plugins folder.`,
+                { confirmText: "Open GitHub", cancelText: "Close", onConfirm: () => { try { require("electron").shell.openExternal("https://github.com/VisaHolder/quest-completer"); } catch { /* */ } } });
+            return;
         }
+        // File is saved. Try to hot-reload; if that doesn't take, the file is still on disk so a plain
+        // Discord reload (Ctrl+R) finishes it - tell the user instead of silently leaving them stale.
+        UI.showToast?.(`Downloaded v${remote} - applying...`, { type: "info" });
+        setTimeout(() => {
+            try { BdApi.Plugins.reload("QuestCompleter"); } catch (e) { console.error("[QC] reload failed", e); }
+            setTimeout(() => {
+                const running = BdApi.Plugins.get("QuestCompleter");
+                if (running && running.version === remote) UI.showToast?.(`Updated to v${remote}.`, { type: "success" });
+                else BdApi.UI.showNotice?.(`QuestCompleter v${remote} is saved - press Ctrl+R to finish applying it.`, { type: "info" });
+            }, 1500);
+        }, 400);
     }
 
     // -- settings (plain DOM - no React mount, so it can't silently blank out) -----
