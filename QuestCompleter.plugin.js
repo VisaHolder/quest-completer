@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.7.0
+ * @version 1.7.1
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.7.0"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.7.1"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -48,6 +48,7 @@ module.exports = class QuestCompleter {
         this.cooldowns = new Map();       // questId -> time until which to skip it after a failed attempt
         this.seenQuests = new Set();      // quest ids we've already seen, for the new-quest heads-up
         this.seenInit = false;            // don't announce the whole existing list on first load
+        this.completedIds = new Set();    // quest ids finished this session - never re-run/re-count them
         this.session = 0;                 // quests completed since this load
         this.settings = Object.assign(
             {
@@ -103,6 +104,7 @@ module.exports = class QuestCompleter {
         if (this.panelIv) { clearInterval(this.panelIv); this.panelIv = null; }
         if (this.bootTimers) { for (const t of this.bootTimers) clearTimeout(t); this.bootTimers = null; }
         this.cooldowns.clear();
+        this.completedIds.clear();
         for (const t of this.timeouts.values()) clearTimeout(t);
         this.timeouts.clear();
         for (const [ev, fn] of this.subs) { try { this.Flux.unsubscribe(ev, fn); } catch { /* */ } }
@@ -219,6 +221,7 @@ module.exports = class QuestCompleter {
             const cfg = q?.config, us = q?.userStatus;
             if (!cfg) continue;
             if (us?.completedAt) continue;                        // already done
+            if (this.completedIds.has(q.id)) continue;            // we finished it this session (store can lag on completedAt)
             const exp = new Date(cfg.expiresAt).getTime();
             if (exp && exp < Date.now()) continue;                // expired
             if (!this.taskOf(q)?.target) continue;                // nothing we can drive
@@ -457,6 +460,7 @@ module.exports = class QuestCompleter {
         const t = this.timeouts.get(id); if (t) { clearTimeout(t); this.timeouts.delete(id); }
         try { this.dispatchGames([], game ? [game] : []); } catch { /* */ }
         if (success) {
+            this.completedIds.add(id); // never re-run or re-count this quest, even if the store lags on completedAt
             const orbs = this.orbsOf(this.QuestsStore.getQuest(id));
             this.stats.completed = (this.stats.completed || 0) + 1; this.session++;
             this.stats.orbs = (this.stats.orbs || 0) + orbs;
