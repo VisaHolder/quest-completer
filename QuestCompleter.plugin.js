@@ -1,8 +1,8 @@
 /**
  * @name QuestCompleter
  * @author GamingSandals
- * @description Set-and-forget Discord Quest completer. Finishes every quest for you - one at a time, at a human pace, pausing while you're away - and auto-does new quests on their own. Claiming the reward stays a manual click (Discord guards that with a captcha). No installs, no sites, no tokens.
- * @version 1.5.8
+ * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
+ * @version 1.5.9
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.5.8"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.5.9"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 module.exports = class QuestCompleter {
@@ -612,7 +612,12 @@ module.exports = class QuestCompleter {
         const btn = document.createElement("button");
         btn.textContent = "Run now";
         btn.style.cssText = "flex:none;cursor:pointer;font-size:13px;font-weight:600;padding:8px 16px;border:none;border-radius:8px;background:#5865f2;color:#fff;";
-        btn.addEventListener("click", () => { this.runAll(); UI.showToast?.("Scanning for quests", { type: "info" }); });
+        btn.addEventListener("click", () => {
+            const n = this.eligibleQuests().filter(q => !this.processing.has(q.id)).length;
+            if (!n) { UI.showToast?.("No quests to do - you're all caught up.", { type: "success" }); return; }
+            this.runAll();
+            UI.showToast?.(`Scanning - ${n} quest${n > 1 ? "s" : ""} to do`, { type: "info" });
+        });
         head.append(statBox, btn); wrap.appendChild(head);
 
         const status = document.createElement("div");
