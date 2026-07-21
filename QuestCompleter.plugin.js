@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.7.5
+ * @version 1.8.0
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.7.5"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.8.0"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -103,6 +103,7 @@ module.exports = class QuestCompleter {
         if (this.pumpT) { clearTimeout(this.pumpT); this.pumpT = null; }
         if (this.panelIv) { clearInterval(this.panelIv); this.panelIv = null; }
         if (this.bootTimers) { for (const t of this.bootTimers) clearTimeout(t); this.bootTimers = null; }
+        if (this._remindT) { clearTimeout(this._remindT); this._remindT = null; }
         this.cooldowns.clear();
         this.completedIds.clear();
         for (const t of this.timeouts.values()) clearTimeout(t);
@@ -481,6 +482,8 @@ module.exports = class QuestCompleter {
             Data.save("stats", this.stats);
             this.claim(id, name); // only fires if autoClaim is opted in; the claim itself is captcha-gated by Discord
             if (this.settings.notify) UI.showToast?.(`Quest done: ${name}${orbs ? ` (+${orbs} orbs)` : ""} - open Quests and press Claim to collect it.`, { type: "success" });
+            // A moment later, pop the clickable "rewards ready to claim" banner (debounced across batches).
+            clearTimeout(this._remindT); this._remindT = setTimeout(() => this.remindUnclaimed(), 8000);
         }
         this.refreshPanel();
         const w = this.waiters.get(id); if (w) { this.waiters.delete(id); w(success); }
@@ -610,8 +613,28 @@ module.exports = class QuestCompleter {
         if (!this.settings.remindUnclaimed) return;
         const names = this.unclaimedNames();
         if (!names.length) return;
-        const msg = `QuestCompleter: ${names.length} reward${names.length > 1 ? "s" : ""} ready to claim - ${names.join(", ")}. Open the Quests tab and press Claim.`;
-        try { BdApi.UI.showNotice(msg, { type: "info" }); } catch { UI.showToast?.(msg, { type: "info" }); }
+        const msg = `QuestCompleter: ${names.length} reward${names.length > 1 ? "s" : ""} ready to claim - ${names.join(", ")}.`;
+        // Persistent banner: its own X closes it; the button jumps straight to the Quests tab to claim.
+        try { BdApi.UI.showNotice(msg, { type: "info", buttons: [{ label: "Go claim", onClick: () => this.openQuests() }] }); }
+        catch { UI.showToast?.(msg, { type: "info" }); }
+    }
+
+    // Jump to the Quests tab so you can hit Claim. Discord's router is locked down in this build, so we
+    // drive its own UI: click the home button (the Quests tab lives there), then click the Quests item.
+    openQuests() {
+        try {
+            const home = document.querySelector('[data-list-item-id="guildsnav___home"]') || document.querySelector('a[href="/channels/@me"]');
+            if (home) home.click();
+        } catch { /* */ }
+        let tries = 0;
+        const tick = () => {
+            if (this.stopped) return;
+            let q = null;
+            try { q = [...document.querySelectorAll('[class*="channel"], [class*="link"], li')].find(e => /^\s*quests\s*$/i.test((e.textContent || "").trim()) && e.offsetParent); } catch { /* */ }
+            if (q) { try { (q.querySelector('a,[role="button"],[class*="link"]') || q).click(); } catch { /* */ } return; }
+            if (++tries < 14) setTimeout(tick, 150); // retry ~2s while the home view renders
+        };
+        setTimeout(tick, 150);
     }
 
     // Heads-up when Discord hands out a quest we haven't seen before (the first load just seeds the set).
@@ -801,7 +824,7 @@ module.exports = class QuestCompleter {
         section("Notifications");
         toggle("notify", "Toast on each completion", "A small popup when a quest is done.");
         toggle("notifyNew", "New-quest heads-up", "A quiet popup when Discord hands out a brand-new quest, so you know it got picked up.");
-        toggle("remindUnclaimed", "Remind me of unclaimed rewards", "When Discord opens, pops a note listing any quest rewards sitting unclaimed - so you don't forget to press Claim.");
+        toggle("remindUnclaimed", "Remind me of unclaimed rewards", "Pops a banner when rewards are ready (on load, and shortly after a quest finishes) listing what's unclaimed. Close it, or click 'Go claim' to jump straight to the Quests tab.");
 
         section("Updates");
         toggle("checkUpdates", "Check for updates automatically", "Checks GitHub now and then; if a newer version is out it offers to update and replaces itself.");
