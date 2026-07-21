@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.7.4
+ * @version 1.7.5
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.7.4"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.7.5"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -111,7 +111,7 @@ module.exports = class QuestCompleter {
         this.subs = [];
         const removed = [...this.fakeGames.values()];
         this.fakeGames.clear(); this.fakeStreams.clear();
-        for (const w of this.waiters.values()) { try { w(); } catch { /* */ } }
+        for (const w of this.waiters.values()) { try { w(false); } catch { /* */ } }
         this.waiters.clear();
         try { this.dispatchGames([], removed); } catch { /* */ }
         try { this.uninstallHide(); } catch { /* */ }
@@ -340,7 +340,13 @@ module.exports = class QuestCompleter {
         if (this.capReached()) { this.schedulePump(20 * 60_000); return; }
         // Candidates: not already running, not cooling down after a recent failed attempt.
         const pool = this.eligibleQuests().filter(q => !this.processing.has(q.id) && !this.onCooldown(q.id));
-        if (!pool.length) return; // nothing to do right now; an event or the 5-min timer re-triggers later
+        if (!pool.length) {
+            // Everything is either running or cooling down. Re-check right when the soonest cooldown lapses
+            // (otherwise only an event or the 5-min timer would nudge it).
+            const soonest = Math.min(...[...this.cooldowns.values()].filter(t => t > now));
+            if (isFinite(soonest)) this.schedulePump(Math.min(soonest - now + 1000, 20 * 60_000));
+            return;
+        }
         // Anything about to expire is always done first; otherwise stealth mode picks at random so the
         // order never looks scripted (still finishes them all), and non-stealth just takes the next one.
         const soon = Date.now() + 2 * 3600_000;
@@ -351,6 +357,7 @@ module.exports = class QuestCompleter {
         try { worked = await this.completeQuest(next); }
         catch (e) { console.error("[QC] pump", e); }
         this.busy = false;
+        if (this.stopped) return; // torn down mid-quest - don't touch stats or reschedule
         if (worked) {
             this.cooldowns.delete(next.id);
             this.dayRoll();
@@ -396,7 +403,7 @@ module.exports = class QuestCompleter {
             return ok !== false;
         } catch (e) {
             console.error("[QC] complete failed for", name, e);
-            this.processing.delete(id);
+            this.finish(id, name, false); // clears processing + any fake game/stream/timeout left for this id
             return false;
         }
     }
