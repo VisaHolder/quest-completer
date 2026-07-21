@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.7.2
+ * @version 1.7.3
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.7.2"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.7.3"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -243,7 +243,10 @@ module.exports = class QuestCompleter {
         // and only pick task types the user has left enabled.
         const order = ["WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE", "PLAY_ON_DESKTOP", "PLAY_ACTIVITY", "STREAM_ON_DESKTOP"];
         for (const name of order) if (tasks[name] && this.typeEnabled(name)) return { name, target: tasks[name].target ?? tasks[name].amount ?? 0 };
-        const first = Object.keys(tasks).find(n => this.typeEnabled(n));
+        // Fallback for task-name variants (e.g. PLAY_ON_XBOX) - but ONLY drivable types. Skip things we
+        // can't fake, like ACHIEVEMENT_IN_ACTIVITY (you have to actually earn it in-game), so we don't
+        // waste a 30-min worker slot heartbeating a quest that can never complete.
+        const first = Object.keys(tasks).find(n => this.typeEnabled(n) && /VIDEO|PLAY|STREAM|ACTIVITY/i.test(n) && !/ACHIEVEMENT/i.test(n));
         return first ? { name: first, target: tasks[first].target ?? tasks[first].amount ?? 0 } : null;
     }
 
