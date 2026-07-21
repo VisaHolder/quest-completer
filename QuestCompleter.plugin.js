@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.7.3
+ * @version 1.7.4
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.7.3"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.7.4"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -188,12 +188,15 @@ module.exports = class QuestCompleter {
                 if (!self.settings.hideCompleted) return real;
                 try {
                     const src = real instanceof Map ? real : new Map(Object.entries(real || {}));
+                    // Only hide a quest once its reward is CLAIMED - a completed-but-unclaimed quest must
+                    // stay visible so you can still grab it. `done` here = fully-finished (claimed) count.
+                    const claimed = q => { const us = q?.userStatus; return us?.completedAt && us?.claimedAt; };
                     // Cheap memo so the UI's store-selectors don't see a brand-new Map every render.
-                    let done = 0; for (const q of src.values()) if (q?.userStatus?.completedAt) done++;
+                    let done = 0; for (const q of src.values()) if (claimed(q)) done++;
                     const sig = src.size + ":" + done;
                     if (self._hideCache && self._hideBase === src && self._hideSig === sig) return self._hideCache;
                     const filtered = new Map();
-                    for (const [k, q] of src) if (!q?.userStatus?.completedAt) filtered.set(k, q);
+                    for (const [k, q] of src) if (!claimed(q)) filtered.set(k, q);
                     self._hideCache = filtered; self._hideBase = src; self._hideSig = sig;
                     return filtered;
                 } catch { return real; }
@@ -762,7 +765,7 @@ module.exports = class QuestCompleter {
         toggle("enabled", "Auto-complete quests", "Master switch. On means every current and future quest gets finished for you, one at a time.", v => { if (v) this.schedulePump(0); });
         toggle("autoEnroll", "Auto-accept new quests", "Enrolls you so you don't have to click Accept first.");
         toggle("autoClaim", "Auto-claim rewards", "Claims the reward when a quest is done. If Discord asks for a captcha, its own native popup appears - solve it once and the claim goes through (nobody can auto-solve it; this just uses Discord's own flow). Claiming is risk-based, so leave off if you'd rather zero automated claim requests and just click Claim yourself.");
-        toggle("hideCompleted", "Hide completed quests", "Clears finished quests off Discord's Quests page so the list only shows what's left. Turn off to see everything you've done.", () => { this._hideCache = null; try { this.QuestsStore.emitChange?.(); } catch { /* */ } });
+        toggle("hideCompleted", "Hide claimed quests", "Clears fully-finished quests off Discord's Quests page. Anything completed but NOT yet claimed stays visible so you can still grab the reward. Turn off to see everything.", () => { this._hideCache = null; try { this.QuestsStore.emitChange?.(); } catch { /* */ } });
 
         section("Quest types");
         toggle("doPlay", "Play a game", "Quests that ask you to play a game.");
