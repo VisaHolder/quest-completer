@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.8.2
+ * @version 1.8.3
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.8.2"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.8.3"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -243,15 +243,19 @@ module.exports = class QuestCompleter {
     taskOf(quest) {
         if (!quest?.config) return null;
         const tasks = (quest.config.taskConfig ?? quest.config.taskConfigV2)?.tasks || {};
+        // Descriptor incl. the game's application id. Newer quests put it on the TASK
+        // (task.applications[0].id); older ones only had quest.config.application.id. Missing this is why
+        // play quests stalled - the faked game had a blank id, so Discord couldn't match it to the quest.
+        const mk = (name) => { const d = tasks[name] || {}; return { name, target: d.target ?? d.amount ?? 0, appId: (d.applications && d.applications[0] && d.applications[0].id) || quest.config.application?.id }; };
         // Prefer the quickest fully-automatable task, always completing as PC (incl. mobile video),
         // and only pick task types the user has left enabled.
         const order = ["WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE", "PLAY_ON_DESKTOP", "PLAY_ACTIVITY", "STREAM_ON_DESKTOP"];
-        for (const name of order) if (tasks[name] && this.typeEnabled(name)) return { name, target: tasks[name].target ?? tasks[name].amount ?? 0 };
+        for (const name of order) if (tasks[name] && this.typeEnabled(name)) return mk(name);
         // Fallback for task-name variants (e.g. PLAY_ON_XBOX) - but ONLY drivable types. Skip things we
         // can't fake, like ACHIEVEMENT_IN_ACTIVITY (you have to actually earn it in-game), so we don't
         // waste a 30-min worker slot heartbeating a quest that can never complete.
         const first = Object.keys(tasks).find(n => this.typeEnabled(n) && /VIDEO|PLAY|STREAM|ACTIVITY/i.test(n) && !/ACHIEVEMENT/i.test(n));
-        return first ? { name: first, target: tasks[first].target ?? tasks[first].amount ?? 0 } : null;
+        return first ? mk(first) : null;
     }
 
     // Quest name for display. Strip angle brackets + cap length so a name from Discord's API can never
@@ -531,7 +535,7 @@ module.exports = class QuestCompleter {
 
     // PLAY_* - pretend the game is running; Discord's own client sends the heartbeats.
     async doPlay(quest, task, name) {
-        const appId = quest.config.application?.id;
+        const appId = task.appId || quest.config.application?.id;
         const pid = 3000 + Math.floor(Math.random() * 27000); // realistic-looking PID
         const folder = (name || "Game").replace(/[^a-z0-9 ]/gi, "").trim() || "Game";
         const exeName = `${folder.replace(/\s+/g, "")}.exe`;
@@ -604,7 +608,7 @@ module.exports = class QuestCompleter {
             this.finish(quest.id, name, false);
             return false;
         }
-        const appId = quest.config.application?.id;
+        const appId = task.appId || quest.config.application?.id;
         const pid = 10000 + Math.floor(Math.random() * 40000);
         this.fakeStreams.set(quest.id, { id: appId, pid, sourceName: null });
         if (this.settings.notify) UI.showToast?.(`Working on: ${name} - stay in the call so Discord counts it.`, { type: "info" });
