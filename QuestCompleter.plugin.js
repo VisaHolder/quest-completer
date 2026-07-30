@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.8.3
+ * @version 1.8.4
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.8.3"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.8.4"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -46,6 +46,7 @@ module.exports = class QuestCompleter {
         this.busy = false;                // only one quest is ever worked at a time
         this.stopped = false;             // set on stop() so nothing re-schedules after teardown
         this.cooldowns = new Map();       // questId -> time until which to skip it after a failed attempt
+        this.fails = new Map();           // questId -> consecutive failed attempts, for escalating backoff
         this.seenQuests = new Set();      // quest ids we've already seen, for the new-quest heads-up
         this.seenInit = false;            // don't announce the whole existing list on first load
         this.completedIds = new Set();    // quest ids finished this session - never re-run/re-count them
@@ -105,6 +106,7 @@ module.exports = class QuestCompleter {
         if (this.bootTimers) { for (const t of this.bootTimers) clearTimeout(t); this.bootTimers = null; }
         if (this._remindT) { clearTimeout(this._remindT); this._remindT = null; }
         this.cooldowns.clear();
+        this.fails.clear();
         this.completedIds.clear();
         for (const t of this.timeouts.values()) clearTimeout(t);
         this.timeouts.clear();
@@ -242,7 +244,11 @@ module.exports = class QuestCompleter {
 
     taskOf(quest) {
         if (!quest?.config) return null;
-        const tasks = (quest.config.taskConfig ?? quest.config.taskConfigV2)?.tasks || {};
+        // Prefer the NEWER taskConfigV2 - that's where the game's application id lives now. Fall back to the
+        // legacy taskConfig only if V2 is absent/empty. Preferring the legacy one (the old `??` order) would
+        // re-blank the appId on new quests that ship BOTH containers - the exact bug we just killed.
+        const pick = c => (c && c.tasks && Object.keys(c.tasks).length) ? c.tasks : null;
+        const tasks = pick(quest.config.taskConfigV2) || pick(quest.config.taskConfig) || {};
         // Descriptor incl. the game's application id. Newer quests put it on the TASK
         // (task.applications[0].id); older ones only had quest.config.application.id. Missing this is why
         // play quests stalled - the faked game had a blank id, so Discord couldn't match it to the quest.
@@ -317,7 +323,7 @@ module.exports = class QuestCompleter {
     // How many orbs a quest pays out (for the running total + history).
     orbsOf(quest) {
         try {
-            const rw = quest?.config?.rewardsConfig?.rewards || quest?.config?.rewards || [];
+            const rw = quest?.config?.rewardsConfig?.rewards || quest?.config?.rewardsConfigV2?.rewards || quest?.config?.rewards || [];
             for (const r of rw) { const n = r.orbQuantity ?? r.orb_quantity; if (n) return +n; }
         } catch { /* */ }
         return 0;
@@ -376,6 +382,7 @@ module.exports = class QuestCompleter {
         if (this.stopped) return; // torn down mid-quest - don't touch stats or reschedule
         if (worked) {
             this.cooldowns.delete(next.id);
+            this.fails.delete(next.id);
             this.dayRoll();
             this.stats.dayCount = (this.stats.dayCount || 0) + 1;
             Data.save("stats", this.stats);
@@ -388,9 +395,11 @@ module.exports = class QuestCompleter {
                 return;
             }
         } else {
-            // Couldn't finish it (e.g. a stream quest with no voice call). Skip it for a bit so the worker
-            // moves on to other quests instead of re-selecting the same stuck one every cycle.
-            this.cooldowns.set(next.id, Date.now() + 15 * 60_000 + Math.random() * 5 * 60_000);
+            // Couldn't finish it. Back off further each consecutive failure (capped ~90 min) so a quest that
+            // genuinely can't be credited stops cycling every 15 min - but we still come back to it later.
+            const n = Math.min(6, (this.fails.get(next.id) || 0) + 1);
+            this.fails.set(next.id, n);
+            this.cooldowns.set(next.id, Date.now() + n * 15 * 60_000 + Math.random() * 5 * 60_000);
         }
         this.schedulePump(this.nextGap()); // short, human spacing before the next attempt
     }
@@ -536,6 +545,14 @@ module.exports = class QuestCompleter {
     // PLAY_* - pretend the game is running; Discord's own client sends the heartbeats.
     async doPlay(quest, task, name) {
         const appId = task.appId || quest.config.application?.id;
+        if (!appId) {
+            // No application id -> Discord can't match a faked game to this quest, so it could NEVER credit.
+            // Fail LOUD and skip instead of silently faking a blank id (this is the exact class of bug that
+            // hid the app-id-moved-to-the-task issue - never let a play quest silently no-op again).
+            console.warn("[QC] play quest has no application id, skipping:", name);
+            this.finish(quest.id, name, false);
+            return false;
+        }
         const pid = 3000 + Math.floor(Math.random() * 27000); // realistic-looking PID
         const folder = (name || "Game").replace(/[^a-z0-9 ]/gi, "").trim() || "Game";
         const exeName = `${folder.replace(/\s+/g, "")}.exe`;
@@ -572,7 +589,7 @@ module.exports = class QuestCompleter {
             const p = us?.progress?.[task.name]?.value ?? 0;
             if (us?.completedAt || (task.target && p >= task.target)) { this.finish(id, name, true); return true; }
             if (p > best) { best = p; lastClimb = Date.now(); }            // it's crediting - keep going
-            else if (Date.now() - lastClimb > 4 * 60_000) break;          // no credit for 4 min - give up
+            else if (Date.now() - lastClimb > 2 * 60_000) break;          // no credit for 2 min - skip, retry later
         }
         this.finish(id, name, false);
         return false;
@@ -609,6 +626,7 @@ module.exports = class QuestCompleter {
             return false;
         }
         const appId = task.appId || quest.config.application?.id;
+        if (!appId) { console.warn("[QC] stream quest has no application id, skipping:", name); this.finish(quest.id, name, false); return false; }
         const pid = 10000 + Math.floor(Math.random() * 40000);
         this.fakeStreams.set(quest.id, { id: appId, pid, sourceName: null });
         if (this.settings.notify) UI.showToast?.(`Working on: ${name} - stay in the call so Discord counts it.`, { type: "info" });
