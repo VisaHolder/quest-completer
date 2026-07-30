@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.8.1
+ * @version 1.8.2
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.8.1"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.8.2"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -555,7 +555,23 @@ module.exports = class QuestCompleter {
         this.fakeGames.set(quest.id, game);
         this.dispatchGames([game], []);
         if (this.settings.notify) UI.showToast?.(`Working on: ${name}`, { type: "info" });
-        return await this.awaitDone(quest.id, name, 30 * 60_000); // completion detected in onHeartbeat()
+        // Discord's own client sends the playtime heartbeats for the faked game; we poll the credited
+        // progress. If NOTHING credits for a few minutes, Discord isn't accepting the fake (a real game is
+        // running, or it's a title with verified integration like League/Arknights) - give up so the single
+        // worker isn't held for 30 min and can move on to video and other quests.
+        const id = quest.id, startedAt = Date.now();
+        let best = this.progress(quest, task.name), lastClimb = startedAt;
+        while (Date.now() - startedAt < 30 * 60_000) {
+            await sleep(25_000 + Math.random() * 10_000);
+            if (this.stopped) return false;
+            const us = this.QuestsStore.getQuest(id)?.userStatus;
+            const p = us?.progress?.[task.name]?.value ?? 0;
+            if (us?.completedAt || (task.target && p >= task.target)) { this.finish(id, name, true); return true; }
+            if (p > best) { best = p; lastClimb = Date.now(); }            // it's crediting - keep going
+            else if (Date.now() - lastClimb > 4 * 60_000) break;          // no credit for 4 min - give up
+        }
+        this.finish(id, name, false);
+        return false;
     }
 
     // PLAY_ACTIVITY - heartbeat on a real cadence using a DM/call channel as the stream key.
@@ -595,9 +611,10 @@ module.exports = class QuestCompleter {
         return await this.awaitDone(quest.id, name, 30 * 60_000);
     }
 
-    // Fired on every heartbeat Discord sends for a faked game/stream - finish anything that's done.
+    // Fired on every heartbeat Discord sends. Play quests are polled in doPlay(); this just finishes
+    // stream quests once Discord credits them.
     onHeartbeat() {
-        for (const id of [...this.fakeGames.keys(), ...this.fakeStreams.keys()]) {
+        for (const id of [...this.fakeStreams.keys()]) {
             const q = this.QuestsStore.getQuest(id);
             const us = q?.userStatus, task = q && this.taskOf(q);
             if (!us || !task) continue;
