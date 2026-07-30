@@ -2,7 +2,7 @@
  * @name QuestCompleter
  * @author GamingSandals
  * @description Auto-completes your Discord Quests at a human pace. You just click Claim.
- * @version 1.8.0
+ * @version 1.8.1
  * @website https://t.me/GamingSandals
  * @source https://github.com/VisaHolder/quest-completer
  * @updateUrl https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js
@@ -26,7 +26,7 @@
  */
 
 const { Webpack, Patcher, Data, UI } = new BdApi("QuestCompleter");
-const VERSION = "1.8.0"; // keep in sync with @version above - used for the self-updater
+const VERSION = "1.8.1"; // keep in sync with @version above - used for the self-updater
 const UPDATE_URL = "https://raw.githubusercontent.com/VisaHolder/quest-completer/main/QuestCompleter.plugin.js";
 
 // Small shared helpers.
@@ -321,6 +321,13 @@ module.exports = class QuestCompleter {
 
     async pump() {
         if (this.stopped || this.busy || !this.settings.enabled) return;
+        // Single worker: with busy=false nothing is actively running, so no quest should still be marked
+        // "processing" and no fake game should linger. Clear any leaked state so one can't get stuck.
+        if (this.processing.size || this.fakeGames.size || this.fakeStreams.size) {
+            const stale = [...this.fakeGames.values()];
+            this.processing.clear(); this.fakeGames.clear(); this.fakeStreams.clear();
+            if (stale.length) { try { this.dispatchGames([], stale); } catch { /* */ } }
+        }
         const now = Date.now();
         // Human warm-up floor - don't touch a quest until the believable delay set in start() has passed.
         if (this.readyAt && now < this.readyAt) { this.schedulePump(this.readyAt - now); return; }
@@ -351,8 +358,12 @@ module.exports = class QuestCompleter {
         // Anything about to expire is always done first; otherwise stealth mode picks at random so the
         // order never looks scripted (still finishes them all), and non-stealth just takes the next one.
         const soon = Date.now() + 2 * 3600_000;
+        const pick = arr => arr.length ? (this.settings.stealth ? arr[Math.floor(Math.random() * arr.length)] : arr[0]) : null;
+        // Video quests are quick and reliable (no game-faking) - do them before play/stream quests that
+        // can stall (e.g. a game Discord won't credit), so one stuck play quest can't hold up the easy ones.
+        const vids = pool.filter(q => /VIDEO/i.test(this.taskOf(q)?.name || ""));
         const next = pool.find(q => { const e = new Date(q.config.expiresAt).getTime(); return e && e < soon; })
-            || (this.settings.stealth ? pool[Math.floor(Math.random() * pool.length)] : pool[0]);
+            || pick(vids) || pick(pool);
         this.busy = true;
         let worked = false;
         try { worked = await this.completeQuest(next); }
